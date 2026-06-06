@@ -13,7 +13,7 @@ use crate::backend;
 use crate::config::{AwgParams, ProxyConfig};
 use crate::metrics::MetricsStore;
 use crate::quic_handshake::{QuicHandshakeResponder, QuicResponse};
-use crate::responder::{self, Protocol};
+use crate::responder::{self, Protocol, SipDialog, SipDialogStage};
 use crate::session::SessionTable;
 use crate::transform;
 
@@ -22,6 +22,43 @@ use crate::transform;
 struct RelayEntry {
     handle: tokio::task::JoinHandle<()>,
     generation: u64,
+}
+
+struct SipDeferredEntry {
+    handle: tokio::task::JoinHandle<()>,
+    generation: u64,
+}
+
+fn sip_stage_after_immediate_response(
+    current: SipDialogStage,
+    stage_before_response: Option<SipDialogStage>,
+    method: &str,
+    responses_len: usize,
+    sent_response_count: usize,
+    sent_any_response: bool,
+    sent_ringing: bool,
+) -> SipDialogStage {
+    if method == "INVITE" {
+        match (stage_before_response.unwrap_or(current), current) {
+            (
+                SipDialogStage::Idle | SipDialogStage::Terminated,
+                SipDialogStage::Idle | SipDialogStage::Terminated,
+            ) if sent_any_response => SipDialogStage::Invited,
+            (SipDialogStage::Invited, SipDialogStage::Invited) if sent_ringing => {
+                SipDialogStage::Ringing
+            }
+            _ => current,
+        }
+    } else if method == "CANCEL" {
+        responder::sip_next_stage(current, method)
+    } else {
+        let sent_all_responses = responses_len != 0 && sent_response_count == responses_len;
+        if sent_all_responses || method == "ACK" {
+            responder::sip_next_stage(current, method)
+        } else {
+            current
+        }
+    }
 }
 
 /// The main proxy runtime state.
@@ -37,13 +74,19 @@ pub struct Proxy {
     dns_upstream: Option<SocketAddr>,
     dns_upstream_timeout: Duration,
     quic_handshake: Option<Arc<Mutex<QuicHandshakeResponder>>>,
+    /// Per-client SIP dialog state, maintained across INVITE/ACK/BYE.
+    sip_dialogs: Arc<DashMap<SocketAddr, SipDialog>>,
     shutdown: Arc<Notify>,
     /// Per-session relay task handles, keyed by client address.
     /// Each task awaits data from the session's backend socket and relays it
     /// back to the client — fully event-driven, no polling.
     relay_handles: Arc<DashMap<SocketAddr, RelayEntry>>,
+    /// Deferred SIP dialog response tasks, keyed by client address.
+    sip_deferred_handles: Arc<DashMap<SocketAddr, SipDeferredEntry>>,
     /// Monotonically increasing generation counter for relay tasks.
     relay_generation: AtomicU64,
+    /// Monotonically increasing generation counter for deferred SIP tasks.
+    sip_deferred_generation: AtomicU64,
 }
 
 impl Proxy {
@@ -107,9 +150,12 @@ impl Proxy {
             dns_upstream,
             dns_upstream_timeout,
             quic_handshake,
+            sip_dialogs: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
+            sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
+            sip_deferred_generation: AtomicU64::new(0),
         })
     }
 
@@ -134,9 +180,12 @@ impl Proxy {
             dns_upstream: None,
             dns_upstream_timeout: Duration::from_millis(1500),
             quic_handshake: None,
+            sip_dialogs: Arc::new(DashMap::new()),
             shutdown: Arc::new(Notify::new()),
             relay_handles: Arc::new(DashMap::new()),
+            sip_deferred_handles: Arc::new(DashMap::new()),
             relay_generation: AtomicU64::new(0),
+            sip_deferred_generation: AtomicU64::new(0),
         }
     }
 
@@ -228,6 +277,10 @@ impl Proxy {
             entry.value().handle.abort();
         });
         self.relay_handles.clear();
+        self.sip_deferred_handles.iter().for_each(|entry| {
+            entry.value().handle.abort();
+        });
+        self.sip_deferred_handles.clear();
         info!("proxy stopped");
         Ok(())
     }
@@ -275,6 +328,10 @@ impl Proxy {
                 // cleanup task will never expire this client's metrics.
                 self.metrics.remove(&client_addr);
                 self.client_protocols.remove(&client_addr);
+                self.sip_dialogs.remove(&client_addr);
+                if let Some((_, entry)) = self.sip_deferred_handles.remove(&client_addr) {
+                    entry.handle.abort();
+                }
             }
         }
     }
@@ -369,6 +426,9 @@ impl Proxy {
                         } else {
                             debug!(%client_addr, "probe rate limited");
                         }
+                    } else if proto == Protocol::Sip {
+                        self.handle_sip_probe(data, client_addr, metrics_ref, false)
+                            .await;
                     } else if metrics.try_acquire_probe() {
                         if proto == Protocol::Dns && self.dns_forward_enabled {
                             probe_response = self.forward_dns_probe(data).await.or_else(|| {
@@ -399,6 +459,320 @@ impl Proxy {
                 metrics.record_probe();
             }
             debug!(%client_addr, "probe response sent");
+        }
+    }
+
+    /// Handle a SIP probe using a per-client stateful dialog.
+    ///
+    /// Sequence for a well-behaved client:
+    /// 1. `INVITE`  → `100 Trying` immediately; `180 Ringing` after ~200 ms;
+    ///    `200 OK` after ~1 s (simulates answer).
+    /// 2. `ACK`     → no response (call established).
+    /// 3. `BYE`     → `200 OK` only once the dialog is established.
+    /// 4. `CANCEL`  → `200 OK` immediately; plus `487 Request Terminated` when an INVITE is still in progress.
+    /// REGISTER / OPTIONS / NOTIFY / SUBSCRIBE / MESSAGE / INFO each get a
+    /// plain `200 OK` using whatever dialog state is available, or a bounded
+    /// lightweight parse if no INVITE has been seen yet.
+    async fn handle_sip_probe(
+        &self,
+        data: &[u8],
+        client_addr: SocketAddr,
+        metrics_ref: &Option<Arc<crate::metrics::ClientMetrics>>,
+        mut pre_acquired_probe_token: bool,
+    ) {
+        let method = match responder::sip_method(data) {
+            Some(m) => m.to_ascii_uppercase(),
+            None => {
+                let allowed = if pre_acquired_probe_token {
+                    true
+                } else {
+                    metrics_ref
+                        .as_ref()
+                        .map_or(true, |metrics| metrics.try_acquire_probe())
+                };
+                if !allowed {
+                    debug!(%client_addr, "SIP fallback response rate limited");
+                    return;
+                }
+
+                let response =
+                    responder::generate_response_for_client(Protocol::Sip, data, client_addr);
+                match self.frontend.send_to(&response, client_addr).await {
+                    Ok(_) => {
+                        if let Some(metrics) = metrics_ref {
+                            metrics.record_probe();
+                        }
+                    }
+                    Err(e) => warn!(%client_addr, error = %e, "failed to send SIP fallback response"),
+                }
+                return;
+            }
+        };
+
+        let mut is_fresh_invite = false;
+        let mut fresh_call_id: Option<String> = None;
+        let mut stage_before_response: Option<SipDialogStage> = None;
+        let mut use_stored_dialog = true;
+        let mut request_dialog: Option<SipDialog> = None;
+
+        // For a fresh INVITE, create (or reset) the dialog from the request.
+        if method == "INVITE" {
+            if let Some(dialog) = SipDialog::from_invite(data) {
+                let existing = self
+                    .sip_dialogs
+                    .get(&client_addr)
+                    .map(|d| (d.stage, d.call_id_value.clone()));
+                let is_new_dialog = existing
+                    .as_ref()
+                    .map(|(stage, call_id_value)| {
+                        matches!(stage, SipDialogStage::Terminated | SipDialogStage::Idle)
+                            || call_id_value != &dialog.call_id_value
+                    })
+                    .unwrap_or(true);
+
+                if is_new_dialog {
+                    fresh_call_id = Some(dialog.call_id_value.clone());
+                    self.sip_dialogs.insert(client_addr, dialog);
+                    is_fresh_invite = true;
+                } else {
+                    // Retransmit for the active dialog — update transaction headers.
+                    if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                        d.update_request_headers(data);
+                    }
+                }
+            } else {
+                self.sip_dialogs.remove(&client_addr);
+                use_stored_dialog = false;
+            }
+        } else {
+            // For non-INVITE methods, only reuse the active dialog if the
+            // incoming request belongs to the same Call-ID. Otherwise build a
+            // bounded response from the request itself without mutating the
+            // active dialog for a different call.
+            let parsed_request = SipDialog::from_request(data);
+            if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                match parsed_request {
+                    Some(dialog) if dialog.call_id_value == d.call_id_value => {
+                        d.update_request_headers(data);
+                    }
+                    Some(dialog) => {
+                        request_dialog = Some(dialog);
+                        use_stored_dialog = false;
+                    }
+                    None => {
+                        use_stored_dialog = false;
+                    }
+                }
+            } else {
+                request_dialog = parsed_request;
+                use_stored_dialog = false;
+            }
+        }
+
+        // Build and send immediate response(s)
+        let responses: Vec<bytes::Bytes> = {
+            if use_stored_dialog {
+                if let Some(d) = self.sip_dialogs.get(&client_addr) {
+                    stage_before_response = Some(d.stage);
+                    responder::generate_sip_responses(&d, &method)
+                } else {
+                    Vec::new()
+                }
+            } else if let Some(dialog) = request_dialog.as_ref() {
+                responder::generate_sip_responses(dialog, &method)
+            } else {
+                // No dialog state yet (e.g. OPTIONS before any INVITE). Try a
+                // bounded header parse for standalone SIP methods that can receive
+                // a 200 OK without dialog state. Malformed ACK/BYE/CANCEL have no
+                // valid transaction headers to reflect, so stay silent instead of
+                // falling back to the legacy INVITE-like 100 Trying path.
+                match method.as_str() {
+                    "ACK" | "BYE" | "CANCEL" => Vec::new(),
+                    "REGISTER" | "OPTIONS" | "NOTIFY" | "SUBSCRIBE" | "MESSAGE" | "INFO" => {
+                        SipDialog::from_request(data)
+                            .map(|dialog| responder::generate_sip_responses(&dialog, &method))
+                            .unwrap_or_default()
+                    }
+                    _ => vec![responder::generate_response_for_client(
+                        Protocol::Sip,
+                        data,
+                        client_addr,
+                    )],
+                }
+            }
+        };
+
+        let mut sent_any_response = false;
+        let mut sent_response_count = 0usize;
+        let mut sent_ringing = false;
+        for pkt in &responses {
+            let allowed = if pre_acquired_probe_token {
+                pre_acquired_probe_token = false;
+                true
+            } else {
+                metrics_ref
+                    .as_ref()
+                    .map_or(true, |metrics| metrics.try_acquire_probe())
+            };
+            if !allowed {
+                debug!(%client_addr, method = %method, "SIP response rate limited");
+                continue;
+            }
+            match self.frontend.send_to(pkt, client_addr).await {
+                Ok(_) => {
+                    if let Some(metrics) = metrics_ref {
+                        metrics.record_probe();
+                    }
+                    sent_any_response = true;
+                    sent_response_count += 1;
+                    if pkt.starts_with(b"SIP/2.0 180 Ringing") {
+                        sent_ringing = true;
+                    }
+                }
+                Err(e) => warn!(%client_addr, error = %e, "failed to send SIP response"),
+            }
+        }
+
+        // Advance the dialog stage
+        if use_stored_dialog {
+            if let Some(mut d) = self.sip_dialogs.get_mut(&client_addr) {
+                d.stage = sip_stage_after_immediate_response(
+                    d.stage,
+                    stage_before_response,
+                    &method,
+                    responses.len(),
+                    sent_response_count,
+                    sent_any_response,
+                    sent_ringing,
+                );
+            }
+        }
+
+        if is_fresh_invite && sent_any_response {
+            let frontend = Arc::clone(&self.frontend);
+            let dialogs = Arc::clone(&self.sip_dialogs);
+            let metrics = metrics_ref.as_ref().map(Arc::clone);
+            let shutdown = Arc::clone(&self.shutdown);
+            let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
+            let generation = self.sip_deferred_generation.fetch_add(1, Ordering::Relaxed);
+            let expected_call_id = match fresh_call_id {
+                Some(call_id) => call_id,
+                None => return,
+            };
+
+            let handle = tokio::spawn(async move {
+                // 180 Ringing after 200 ms. Check the current stage at send
+                // time so retransmits that already emitted 180 suppress this.
+                tokio::select! {
+                    _ = time::sleep(Duration::from_millis(200)) => {}
+                    _ = shutdown.notified() => {
+                        sip_deferred_handles.remove_if(&client_addr, |_, entry| {
+                            entry.generation == generation
+                        });
+                        return;
+                    }
+                }
+                let ringing_allowed = metrics
+                    .as_ref()
+                    .map_or(true, |metrics| metrics.try_acquire_probe());
+                if ringing_allowed {
+                    let sent = dialogs.get_mut(&client_addr).is_some_and(|mut d| {
+                        if d.stage == SipDialogStage::Invited
+                            && d.call_id_value == expected_call_id
+                        {
+                            let pkt = responder::generate_sip_ringing(&d);
+                            match frontend.try_send_to(&pkt, client_addr) {
+                                Ok(_) => {
+                                    d.stage = SipDialogStage::Ringing;
+                                    true
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    debug!(%client_addr, error = %e, "deferred SIP 180 Ringing send would block");
+                                    false
+                                }
+                                Err(e) => {
+                                    warn!(%client_addr, error = %e, "failed to send deferred SIP 180 Ringing");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    });
+                    if sent {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_probe();
+                        }
+                    }
+                } else {
+                    debug!(%client_addr, "deferred SIP 180 Ringing rate limited");
+                }
+
+                // 200 OK after another 800 ms (total ~1 s). Use try_send_to
+                // while holding the dialog guard so the final state check,
+                // send, and Established transition happen without an await gap
+                // where a CANCEL/BYE could terminate the dialog.
+                tokio::select! {
+                    _ = time::sleep(Duration::from_millis(800)) => {}
+                    _ = shutdown.notified() => {
+                        sip_deferred_handles.remove_if(&client_addr, |_, entry| {
+                            entry.generation == generation
+                        });
+                        return;
+                    }
+                }
+                let ok_allowed = metrics
+                    .as_ref()
+                    .map_or(true, |metrics| metrics.try_acquire_probe());
+                if ok_allowed {
+                    let sent = dialogs.get_mut(&client_addr).is_some_and(|mut d| {
+                        if matches!(d.stage, SipDialogStage::Invited | SipDialogStage::Ringing)
+                            && d.call_id_value == expected_call_id
+                        {
+                            let pkt = responder::generate_sip_ok(&d);
+                            match frontend.try_send_to(&pkt, client_addr) {
+                                Ok(_) => {
+                                    d.stage = SipDialogStage::Established;
+                                    true
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    debug!(%client_addr, error = %e, "deferred SIP 200 OK send would block");
+                                    false
+                                }
+                                Err(e) => {
+                                    warn!(%client_addr, error = %e, "failed to send deferred SIP 200 OK");
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    });
+                    if sent {
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_probe();
+                        }
+                    }
+                } else {
+                    debug!(%client_addr, "deferred SIP 200 OK rate limited");
+                }
+                sip_deferred_handles.remove_if(&client_addr, |_, entry| {
+                    entry.generation == generation
+                });
+            });
+            if let Some((_, old_entry)) = self.sip_deferred_handles.remove(&client_addr) {
+                old_entry.handle.abort();
+            }
+            self.sip_deferred_handles
+                .insert(client_addr, SipDeferredEntry { handle, generation });
+            if let Some(entry) = self.sip_deferred_handles.get(&client_addr) {
+                if entry.handle.is_finished() {
+                    drop(entry);
+                    self.sip_deferred_handles.remove_if(&client_addr, |_, e| {
+                        e.generation == generation && e.handle.is_finished()
+                    });
+                }
+            }
         }
     }
 
@@ -438,6 +812,8 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let fixed_protocol = self.fixed_protocol;
         let client_protocols = Arc::clone(&self.client_protocols);
+        let sip_dialogs = Arc::clone(&self.sip_dialogs);
+        let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let awg_params = self.awg_params.clone();
         // Size the per-session relay buffer from configured `buffer_size` so
         // backend datagrams are not silently truncated by `recv()`.
@@ -489,6 +865,10 @@ impl Proxy {
                         sessions.remove(&client_addr);
                         client_protocols.remove(&client_addr);
                         metrics.remove(&client_addr);
+                        sip_dialogs.remove(&client_addr);
+                        if let Some((_, entry)) = sip_deferred_handles.remove(&client_addr) {
+                            entry.handle.abort();
+                        }
                         break;
                     }
                 }
@@ -527,7 +907,9 @@ impl Proxy {
         let sessions = Arc::clone(&self.sessions);
         let metrics = Arc::clone(&self.metrics);
         let client_protocols = Arc::clone(&self.client_protocols);
+        let sip_dialogs = Arc::clone(&self.sip_dialogs);
         let relay_handles = Arc::clone(&self.relay_handles);
+        let sip_deferred_handles = Arc::clone(&self.sip_deferred_handles);
         let interval = Duration::from_secs(self.config.cleanup_interval_secs);
 
         tokio::spawn(async move {
@@ -539,6 +921,10 @@ impl Proxy {
                 for addr in &expired {
                     metrics.remove(addr);
                     client_protocols.remove(addr);
+                    sip_dialogs.remove(addr);
+                    if let Some((_, entry)) = sip_deferred_handles.remove(addr) {
+                        entry.handle.abort();
+                    }
                     // Abort the relay task for the expired session
                     if let Some((_, entry)) = relay_handles.remove(addr) {
                         entry.handle.abort();
@@ -552,9 +938,112 @@ impl Proxy {
     }
 }
 
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.relay_handles.iter().for_each(|entry| {
+            entry.value().handle.abort();
+        });
+        self.sip_deferred_handles.iter().for_each(|entry| {
+            entry.value().handle.abort();
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sip_invite_stage_update_does_not_regress_live_stage() {
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Idle,
+                Some(SipDialogStage::Idle),
+                "INVITE",
+                1,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Invited
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Invited,
+                Some(SipDialogStage::Invited),
+                "INVITE",
+                2,
+                2,
+                true,
+                true,
+            ),
+            SipDialogStage::Ringing
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Ringing,
+                Some(SipDialogStage::Idle),
+                "INVITE",
+                1,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Ringing
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Established,
+                Some(SipDialogStage::Invited),
+                "INVITE",
+                2,
+                2,
+                true,
+                true,
+            ),
+            SipDialogStage::Established
+        );
+    }
+
+    #[test]
+    fn sip_cancel_stage_update_advances_on_cancel_receipt() {
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Invited,
+                Some(SipDialogStage::Invited),
+                "CANCEL",
+                2,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Terminated
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Ringing,
+                Some(SipDialogStage::Ringing),
+                "CANCEL",
+                2,
+                1,
+                true,
+                false,
+            ),
+            SipDialogStage::Terminated
+        );
+        assert_eq!(
+            sip_stage_after_immediate_response(
+                SipDialogStage::Invited,
+                Some(SipDialogStage::Invited),
+                "CANCEL",
+                2,
+                0,
+                false,
+                false,
+            ),
+            SipDialogStage::Terminated
+        );
+    }
 
     #[tokio::test]
     async fn proxy_bind_and_shutdown() {
@@ -692,7 +1181,8 @@ mod tests {
     /// Layout: [S4 bytes of QUIC-like padding] ++ [H4 header LE u32] ++ [body]
     fn awg_quic_masked_transport_packet(params: &crate::config::AwgParams) -> Vec<u8> {
         let s4 = params.s4 as usize;
-        let h4_value = params.h4.min; // any value in range
+        let h4_value = params.h4.min;
+
         // S4 padding that passes detect_protocol's QUIC heuristic:
         //   byte 0: 0xC0 (long-header form + fixed bit, Initial type, PN len 0)
         //   bytes 1-4: 0x00000001 (QUIC v1)
@@ -701,17 +1191,53 @@ mod tests {
         //   byte 14: SCID length = 0
         //   bytes 15..: fill to reach s4
         let mut pkt = vec![0u8; s4];
-        if s4 >= 1 { pkt[0] = 0xC0; }
-        if s4 >= 5 { pkt[1] = 0x00; pkt[2] = 0x00; pkt[3] = 0x00; pkt[4] = 0x01; }
-        if s4 >= 6 { pkt[5] = 8; } // DCID len
+        if s4 >= 1 {
+            pkt[0] = 0xC0;
+        }
+        if s4 >= 5 {
+            pkt[1] = 0x00;
+            pkt[2] = 0x00;
+            pkt[3] = 0x00;
+            pkt[4] = 0x01;
+        }
+        if s4 >= 6 {
+            pkt[5] = 8;
+        }
         // bytes 6..14: DCID (arbitrary non-zero)
-        for i in 6..std::cmp::min(14, s4) { pkt[i] = 0xAB; }
-        if s4 > 14 { pkt[14] = 0; } // SCID len = 0
+        for i in 6..std::cmp::min(14, s4) {
+            pkt[i] = 0xAB;
+        }
+        if s4 > 14 {
+            pkt[14] = 0;
+        }
         // Append H4 header (LE u32) then body to meet TransportData minimum size.
         pkt.extend_from_slice(&h4_value.to_le_bytes());
         // Body: needs at least WG_TRANSPORT_DATA_MIN_SIZE (32) bytes after s4.
         pkt.extend(std::iter::repeat(0xBBu8).take(32));
         pkt
+    }
+
+    fn sip_test_config(backend_addr: SocketAddr) -> ProxyConfig {
+        sip_test_config_with_rate(backend_addr, 16)
+    }
+
+    fn sip_test_config_with_rate(backend_addr: SocketAddr, rate_limit_per_sec: u32) -> ProxyConfig {
+        ProxyConfig {
+            listen: "127.0.0.1:0".into(),
+            backend: backend_addr.to_string(),
+            session_ttl_secs: 60,
+            cleanup_interval_secs: 60,
+            rate_limit_per_sec,
+            imitate_protocol: "sip".into(),
+            quic_handshake_enabled: false,
+            quic_certificate_domain: "localhost".into(),
+            dns_forward_enabled: false,
+            dns_upstream: "127.0.0.1:53".into(),
+            dns_upstream_timeout_ms: 1500,
+            buffer_size: 4096,
+            max_sessions: 1000,
+            awg_config: None,
+        }
     }
 
     #[tokio::test]
@@ -731,10 +1257,22 @@ mod tests {
             s2: 142,
             s3: 59,
             s4: 40,
-            h1: HRange { min: 102_875_432, max: 202_875_431 },
-            h2: HRange { min: 728_639_326, max: 828_639_325 },
-            h3: HRange { min: 1_469_276_895, max: 1_569_276_894 },
-            h4: HRange { min: 2_037_058_179, max: 2_137_058_178 },
+            h1: HRange {
+                min: 102_875_432,
+                max: 202_875_431,
+            },
+            h2: HRange {
+                min: 728_639_326,
+                max: 828_639_325,
+            },
+            h3: HRange {
+                min: 1_469_276_895,
+                max: 1_569_276_894,
+            },
+            h4: HRange {
+                min: 2_037_058_179,
+                max: 2_137_058_178,
+            },
         };
 
         let config = ProxyConfig {
@@ -959,5 +1497,994 @@ mod tests {
         let second =
             tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
         assert!(second.is_err(), "second probe should be rate limited");
+    }
+
+    #[tokio::test]
+    async fn sip_options_without_dialog_returns_200_ok() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let options = b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: options-call@192.168.224.194\r\n\
+CSeq: 95930 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(options, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("OPTIONS should receive a SIP response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains("CSeq: 95930 OPTIONS"));
+        assert_eq!(
+            metrics_ref
+                .unwrap()
+                .probes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_response_line_probe_gets_stateless_response() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let response_probe = b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKresponse;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>;tag=remote\r\n\
+Call-ID: response-line-probe@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_probe(
+                response_probe,
+                client_addr,
+                &proxy.metrics.get_or_create(client_addr),
+            )
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("SIP response-line probe should receive stateless fallback")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying\r\n"));
+        assert!(text.contains("Call-ID: response-line-probe@192.168.224.194"));
+        assert!(text.contains("CSeq: 95930 INVITE"));
+    }
+
+    #[tokio::test]
+    async fn sip_invite_retransmit_suppresses_deferred_duplicate_ringing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: retransmit-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("fresh INVITE should receive 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("retransmitted INVITE should receive immediate responses")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            statuses.push(
+                std::str::from_utf8(&buf[..n])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 100 Trying"));
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 180 Ringing"));
+
+        let duplicate =
+            tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
+        assert!(
+            duplicate.is_err(),
+            "deferred timer must not emit a second 180 after retransmit"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_invite_with_new_call_id_replaces_active_dialog() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let old_invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKold;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=old\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: old-active-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let new_invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKnew;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=new\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: new-active-call@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(old_invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("old INVITE should receive 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .contains("Call-ID: old-active-call@192.168.224.194"));
+
+        proxy
+            .handle_sip_probe(new_invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("new INVITE should receive response from new dialog")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("Call-ID: new-active-call@192.168.224.194"));
+        assert!(!text.contains("old-active-call@192.168.224.194"));
+        assert_eq!(
+            proxy
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| d.call_id.clone())
+                .as_deref(),
+            Some("Call-ID: new-active-call@192.168.224.194")
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_invite_same_call_id_value_is_retransmit() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKfirst;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=first\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: same-active-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let retransmit = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKretransmit;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=first\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+CALL-ID:    same-active-call@192.168.224.194   \r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("fresh INVITE should receive response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy
+            .handle_sip_probe(retransmit, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut statuses = Vec::new();
+        let mut saw_retransmit_via = false;
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("same Call-ID value should be treated as retransmit")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            let text = std::str::from_utf8(&buf[..n]).unwrap();
+            statuses.push(text.lines().next().unwrap().to_string());
+            saw_retransmit_via |= text.contains("branch=z9hG4bKretransmit");
+            assert!(text.contains("Call-ID: same-active-call@192.168.224.194"));
+            assert!(!text.contains("CALL-ID:"));
+        }
+
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 100 Trying"));
+        assert!(statuses.iter().any(|s| s == "SIP/2.0 180 Ringing"));
+        assert!(saw_retransmit_via);
+        assert_eq!(
+            proxy
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| d.call_id_value.clone())
+                .as_deref(),
+            Some("same-active-call@192.168.224.194")
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_non_invite_different_call_id_does_not_reuse_active_dialog() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKactive;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=active\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: active-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let options = b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKother;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=other\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: other-call@192.168.224.194\r\n\
+CSeq: 95930 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut active_dialog = SipDialog::from_invite(invite).unwrap();
+        active_dialog.stage = SipDialogStage::Established;
+        proxy.sip_dialogs.insert(client_addr, active_dialog);
+
+        proxy
+            .handle_sip_probe(options, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("mismatched OPTIONS should receive request-scoped response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(text.contains("Call-ID: other-call@192.168.224.194"));
+        assert!(!text.contains("active-call@192.168.224.194"));
+        assert_eq!(
+            proxy
+                .sip_dialogs
+                .get(&client_addr)
+                .map(|d| (d.call_id_value.clone(), d.stage)),
+            Some((
+                "active-call@192.168.224.194".to_string(),
+                SipDialogStage::Established
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_immediate_responses_consume_rate_limit_per_packet() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 1), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let metrics = metrics_ref.as_ref().unwrap();
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-retransmit@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut dialog = SipDialog::from_invite(invite).unwrap();
+        dialog.stage = SipDialogStage::Invited;
+        proxy.sip_dialogs.insert(client_addr, dialog);
+        assert!(
+            metrics.try_acquire_probe(),
+            "pre-acquire inbound probe token"
+        );
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("pre-acquired token should allow first response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+        let second =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+        assert!(
+            second.is_err(),
+            "second immediate SIP response must require another rate token"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_ack_without_response_does_not_consume_probe_token() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 1), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let ack = b"ACK sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKack;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: ack-no-response@192.168.224.194\r\n\
+CSeq: 95929 ACK\r\n\
+Content-Length: 0\r\n\r\n";
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: ack-no-response@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_probe(ack, client_addr, &proxy.metrics.get_or_create(client_addr))
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let ack_response =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(ack_response.is_err(), "ACK without dialog should not emit a response");
+
+        proxy
+            .handle_probe(invite, client_addr, &proxy.metrics.get_or_create(client_addr))
+            .await;
+
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should still have the only rate token available")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+    }
+
+    #[tokio::test]
+    async fn malformed_bye_cancel_without_dialog_do_not_fallback_to_trying() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 2), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let mut buf = [0u8; 1024];
+
+        for request in [
+            b"BYE sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+            b"CANCEL sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+        ] {
+            proxy.handle_probe(request, client_addr, &metrics_ref).await;
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+            assert!(
+                response.is_err(),
+                "malformed standalone BYE/CANCEL must not receive stateless 100 Trying"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_standalone_methods_do_not_fallback_to_trying() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 2), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let mut buf = [0u8; 1024];
+
+        for request in [
+            b"OPTIONS sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+            b"REGISTER sip:olivia@profi.ru SIP/2.0\r\nCall-ID: missing-headers\r\n\r\n".as_slice(),
+        ] {
+            proxy.handle_probe(request, client_addr, &metrics_ref).await;
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+            assert!(
+                response.is_err(),
+                "malformed standalone requests must not receive stateless 100 Trying"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sip_non_invite_does_not_advance_when_response_suppressed() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 0), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-bye@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let bye = b"BYE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKbye;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-bye@192.168.224.194\r\n\
+CSeq: 95930 BYE\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut dialog = SipDialog::from_invite(invite).unwrap();
+        dialog.stage = SipDialogStage::Established;
+        proxy.sip_dialogs.insert(client_addr, dialog);
+
+        proxy
+            .handle_sip_probe(bye, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let response =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(response.is_err(), "rate-limited BYE should not emit 200 OK");
+        assert_eq!(
+            proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
+            Some(SipDialogStage::Established)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_cancel_advances_when_487_is_rate_limited() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 1), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-cancel@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: rate-limited-cancel@192.168.224.194\r\n\
+CSeq: 95930 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut dialog = SipDialog::from_invite(invite).unwrap();
+        dialog.stage = SipDialogStage::Invited;
+        proxy.sip_dialogs.insert(client_addr, dialog);
+
+        proxy
+            .handle_sip_probe(cancel, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("first CANCEL response should use the only available token")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 200 OK\r\n"));
+
+        let second =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(second.is_err(), "487 should be suppressed by rate limit");
+        assert_eq!(
+            proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
+            Some(SipDialogStage::Terminated)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_cancel_before_answer_suppresses_deferred_invite_ok() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-answer@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-answer@192.168.224.194\r\n\
+CSeq: 95930 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive immediate 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive deferred 180 Ringing")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 180 Ringing\r\n"));
+
+        proxy
+            .handle_sip_probe(cancel, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut cancel_responses = Vec::new();
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("CANCEL should receive both immediate responses")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            cancel_responses.push(std::str::from_utf8(&buf[..n]).unwrap().to_string());
+        }
+        assert!(cancel_responses
+            .iter()
+            .any(|s| s.starts_with("SIP/2.0 200 OK\r\n") && s.contains("CSeq: 95930 CANCEL")));
+        assert!(cancel_responses
+            .iter()
+            .any(|s| s.starts_with("SIP/2.0 487 Request Terminated\r\n")));
+
+        let late =
+            tokio::time::timeout(Duration::from_millis(900), client.recv_from(&mut buf)).await;
+        assert!(
+            late.is_err(),
+            "deferred INVITE 200 OK must not be sent after CANCEL"
+        );
+        assert_eq!(
+            proxy.sip_dialogs.get(&client_addr).map(|d| d.stage),
+            Some(SipDialogStage::Terminated)
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_cancel_before_ringing_suppresses_deferred_ringing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKinvite;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-ringing@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let cancel = b"CANCEL sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcancel;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cancel-before-ringing@192.168.224.194\r\n\
+CSeq: 95930 CANCEL\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive immediate 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy
+            .handle_sip_probe(cancel, client_addr, &metrics_ref, false)
+            .await;
+
+        let mut cancel_responses = Vec::new();
+        for _ in 0..2 {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                    .await
+                    .expect("CANCEL should receive both immediate responses")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            cancel_responses.push(std::str::from_utf8(&buf[..n]).unwrap().to_string());
+        }
+        assert!(cancel_responses
+            .iter()
+            .all(|s| !s.starts_with("SIP/2.0 180 Ringing\r\n")));
+
+        let late =
+            tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
+        assert!(
+            late.is_err(),
+            "deferred 180/200 must not be sent after early CANCEL"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_task_removes_finished_handle() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKcleanup;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: cleanup-deferred@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        for expected in [
+            "SIP/2.0 100 Trying\r\n",
+            "SIP/2.0 180 Ringing\r\n",
+            "SIP/2.0 200 OK\r\n",
+        ] {
+            let (n, _) =
+                tokio::time::timeout(Duration::from_millis(1200), client.recv_from(&mut buf))
+                    .await
+                    .expect("expected SIP response")
+                    .unwrap();
+            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !proxy.sip_deferred_handles.contains_key(&client_addr),
+            "finished deferred SIP task should remove its handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_task_stops_on_shutdown() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKshutdown;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: shutdown-deferred@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("INVITE should receive immediate 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        proxy.shutdown_handle().notify_one();
+
+        let deferred =
+            tokio::time::timeout(Duration::from_millis(350), client.recv_from(&mut buf)).await;
+        assert!(
+            deferred.is_err(),
+            "shutdown should suppress deferred SIP 180/200 responses"
+        );
+        assert!(
+            !proxy.sip_deferred_handles.contains_key(&client_addr),
+            "shutdown before 180 should remove the deferred SIP task handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_task_removes_handle_on_shutdown_after_ringing() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKshutdown-after-ringing;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: shutdown-after-ringing@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        for expected in ["SIP/2.0 100 Trying\r\n", "SIP/2.0 180 Ringing\r\n"] {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+                    .await
+                    .expect("expected SIP response before shutdown")
+                    .unwrap();
+            assert_eq!(from, proxy_addr);
+            assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with(expected));
+        }
+
+        proxy.shutdown_handle().notify_one();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !proxy.sip_deferred_handles.contains_key(&client_addr),
+            "shutdown before 200 should remove the deferred SIP task handle"
+        );
+        let final_ok =
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf)).await;
+        assert!(final_ok.is_err(), "shutdown should suppress deferred SIP 200 OK");
+    }
+
+    #[tokio::test]
+    async fn sip_deferred_responses_consume_rate_limit_tokens() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config_with_rate(backend_addr, 0), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let invite = b"INVITE sip:olivia@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKee43689b8812e305;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=a3c46b4581b775e4\r\n\
+To: Olivia <sip:olivia@profi.ru>\r\n\
+Call-ID: deferred-rate-limit@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("pre-acquired token should allow initial 100 Trying")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("SIP/2.0 100 Trying\r\n"));
+
+        let extra =
+            tokio::time::timeout(Duration::from_millis(1200), client.recv_from(&mut buf)).await;
+        assert!(
+            extra.is_err(),
+            "deferred SIP responses must require their own rate tokens"
+        );
+        assert_eq!(
+            metrics_ref
+                .unwrap()
+                .probes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_fresh_invite_drops_stale_dialog_state() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let proxy = Proxy::bind(sip_test_config(backend_addr), None)
+            .await
+            .unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let metrics_ref = proxy.metrics.get_or_create(client_addr);
+        let old_invite = b"INVITE sip:old@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKold;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=old\r\n\
+To: Olivia <sip:old@profi.ru>\r\n\
+Call-ID: old-call@192.168.224.194\r\n\
+CSeq: 95929 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+        let mut old_dialog = SipDialog::from_invite(old_invite).unwrap();
+        old_dialog.stage = SipDialogStage::Terminated;
+        proxy.sip_dialogs.insert(client_addr, old_dialog);
+
+        let malformed_invite = b"INVITE sip:new@profi.ru SIP/2.0\r\n\
+Via: SIP/2.0/UDP 172.23.4.143:59672;branch=z9hG4bKnew;rport\r\n\
+From: Frank545 <sip:frank545@profi.ru>;tag=new\r\n\
+Call-ID: new-call@192.168.224.194\r\n\
+CSeq: 95930 INVITE\r\n\
+Content-Length: 0\r\n\r\n";
+
+        proxy
+            .handle_sip_probe(malformed_invite, client_addr, &metrics_ref, true)
+            .await;
+
+        let mut buf = [0u8; 1024];
+        let (n, from) =
+            tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf))
+                .await
+                .expect("malformed INVITE should receive stateless SIP response")
+                .unwrap();
+        assert_eq!(from, proxy_addr);
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.starts_with("SIP/2.0 100 Trying\r\n"));
+        assert!(text.contains("Call-ID: new-call@192.168.224.194"));
+        assert!(!text.contains("old-call@192.168.224.194"));
+        assert!(!proxy.sip_dialogs.contains_key(&client_addr));
     }
 }
